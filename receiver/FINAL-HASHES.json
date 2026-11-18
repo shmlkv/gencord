@@ -1,0 +1,8 @@
+{
+  "gencord_receiver.py": "6ee0681019ac69431ef89f936c84b1af7f811c95d360263ac965a1681059ce6c",
+  "test_receiver.py": "30e7059a0898a584071b7fbf3fb916f9e0401cf834e2f8232ee649556fb529e2",
+  "README.md": "d0f8e5408a8dfba52a16cad96cbede877556e8040628be637cf1626e4fac270e",
+  "gencord-receiver.service": "1faf6d2e55d232bef119d10737c278b1d0217552474996f686566ad26b29c3cb",
+  "ACTIONS-receiver.md": "52433eaa4c75fc644212e830ec32e6b2c9f79b465c0cfdbc46447ecf4830469a",
+  ".gitignore": "862263fa1f46c20f0d1e4dac5ffcc75abd55c08211b2c3864c5f8764b9d87793"
+}

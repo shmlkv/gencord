@@ -1,15 +1,6 @@
-// gencord - voice recorder for the original M5Stack Cardputer (StampS3)
-//
-//  - G0 button (from sleep or menu): start recording. Double-click G0: stop.
-//  - Recording runs with the screen off; any key shows the status for 3 s.
-//  - After stopping you can type a name (Enter / G0 / timeout saves).
-//  - Files: /rec/YYYY-MM-DD_HH-MM-SS[_name].wav (16 kHz mono 16-bit).
-//  - A USB microphone on USB-C (DJI Mic Mini 2 receiver) is used instead of the
-//    built-in mic when one answers at the start of a recording (see usb_mic.h).
-//  - When the home Wi-Fi is in range, every recording is uploaded to the
-//    Synology via WebDAV, verified by size, and only then deleted locally.
-//  - Between uses the device is in deep sleep; with pending files it wakes
-//    every WIFI_CHECK_MIN minutes to look for the home network.
+// gencord ADV: USB-only, 16 kHz PCM16 stereo. L/R are never mixed.
+// Files and configuration are isolated under /gencord-adv; uploaded originals stay on SD.
+// Build-only artifact: do not flash over Launcher/Nucleo/Switch Bridge partitions.
 
 #include <M5Cardputer.h>
 #include <SD.h>
@@ -22,18 +13,18 @@
 #include <driver/gpio.h>
 #include <driver/rtc_io.h>
 #include <freertos/queue.h>
-#include <driver/i2s_pdm.h>
+#include <unistd.h>
 #include <Preferences.h>
 #include <sys/time.h>
 #include <vector>
 #include "usb_mic.h"
 
-// Settings come from /recorder.cfg on the SD card (editable on the device with 'c').
+// Settings come from /gencord-adv/recorder.cfg on the SD card (editable on the device with 'c').
 // config.h (optional, gitignored) only provides defaults for a private build.
 #if __has_include("config.h")
 #include "config.h"
 #endif
-#define GENCORD_VERSION "v0.11"  // shown on the menu cassette; raise with every flash
+#define GENCORD_VERSION "ADV-dual-1"  // shown on the menu cassette; raise with every flash
 
 #ifndef WIFI_SSID
 #define WIFI_SSID ""
@@ -58,9 +49,6 @@
 #endif
 #ifndef SAMPLE_RATE
 #define SAMPLE_RATE 16000
-#endif
-#ifndef AGC_MAX
-#define AGC_MAX 64  // maximum automatic gain
 #endif
 #ifndef WIFI_CHECK_MIN
 #define WIFI_CHECK_MIN 20
@@ -88,23 +76,23 @@ struct Settings {
   String ssid = WIFI_SSID, pass = WIFI_PASS;
   String davUrl = DAV_URL, davUser = DAV_USER, davPass = DAV_PASS;
   String tz = TZ_INFO, ntp = NTP_SERVER;
-  int agcMax = AGC_MAX, wifiCheckMin = WIFI_CHECK_MIN;
-  bool usbMic = true;  // look for a USB microphone (DJI receiver) when recording on battery
+  int wifiCheckMin = WIFI_CHECK_MIN;
 } S;
-static constexpr const char* CFG_PATH = "/recorder.cfg";
+static constexpr const char* CFG_PATH = "/gencord-adv/recorder.cfg";
 
 // ---------------------------------------------------------------- hardware
 static constexpr int PIN_SD_SCK = 40, PIN_SD_MISO = 39, PIN_SD_MOSI = 14, PIN_SD_CS = 12;
 static constexpr gpio_num_t PIN_BTN = GPIO_NUM_0;
-// Held low during deep sleep: keyboard 74HC138 address lines, mic clock, backlight.
-static constexpr gpio_num_t HOLD_LOW_PINS[] = {GPIO_NUM_8, GPIO_NUM_9, GPIO_NUM_11, GPIO_NUM_43, GPIO_NUM_38};
+// ADV has TCA8418 keyboard and codec: never drive legacy matrix/audio pins.
+static constexpr gpio_num_t HOLD_LOW_PINS[] = {GPIO_NUM_38};
 
-static constexpr const char* REC_DIR = "/rec";
-static constexpr const char* LOG_PATH = "/log.csv";
+static constexpr const char* REC_DIR = "/gencord-adv/recordings";
+static constexpr const char* LOG_PATH = "/gencord-adv/log.csv";
 static constexpr size_t LOG_MAX_BYTES = 256 * 1024;
 
 // ---------------------------------------------------------------- audio buffers
-// 12 x 250 ms: the mic task keeps recording for ~3 s even if the SD card stalls.
+// 12 x 125 ms stereo = 96 KB fixed PCM pool; overflow ends capture with an error.
+static_assert(SAMPLE_RATE == gencord::OutputRate, "USB output is fixed at 16 kHz");
 static constexpr size_t BUF_SAMPLES = SAMPLE_RATE / 4;
 static constexpr int NBUF = 12;
 static int16_t bufs[NBUF][BUF_SAMPLES];
@@ -144,7 +132,7 @@ RTC_DATA_ATTR static bool rtcTimeExact = false;  // NTP or manually set since po
 static void saveClock() {
   if (!timeValid()) return;
   Preferences p;
-  p.begin("gencord", false);
+  p.begin("gencord-adv", false);
   p.putLong64("t", (int64_t)time(nullptr));
   p.end();
 }
@@ -152,7 +140,7 @@ static void saveClock() {
 static bool restoreClock() {
   if (timeValid()) return false;
   Preferences p;
-  p.begin("gencord", true);
+  p.begin("gencord-adv", true);
   int64_t t = p.getLong64("t", 0);
   p.end();
   if (t < 1704067200) return false;
@@ -343,58 +331,24 @@ static void footer(LovyanGFX& d, const String& a, const String& b) {
   d.print(b);
 }
 
-static volatile int32_t levelPeak = 0;  // peak of the latest 125 ms block (set in toMono)
-static float agcGain = 4.0f;            // current automatic gain (see toMono)
-
-// 0..1 position of the AGC gain on a log scale x1..x64.
-static float gainFrac() { return constrain(log2f(max(agcGain, 1.0f)) / 6.0f, 0.0f, 1.0f); }
-
-// Green (x1) -> yellow -> orange -> red (x64).
-static uint16_t gainColor() {
-  const float t = gainFrac();
-  const uint8_t r = t < 0.5f ? (uint8_t)(510 * t) : 255;
-  const uint8_t g = t < 0.5f ? 220 : (uint8_t)(220 * (1.0f - t) * 2.0f);
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3);
-}
-
-// Square badge with the current gain in black, e.g. "x10".
-static void gainBadge(LovyanGFX& d, int x, int y, int w, int h) {
-  d.fillRoundRect(x, y, w, h, 3, gainColor());
-  d.setTextSize(1);
-  d.setTextColor(TFT_BLACK);
-  d.setTextDatum(textdatum_t::middle_center);
-  d.drawString("x" + String((int)lroundf(agcGain)), x + w / 2, y + h / 2 + 1);
-  d.setTextDatum(textdatum_t::top_left);
-}
-
-// Old-style mono LED bar right of the cassette: 16 segments, -48..0 dBFS, rising
-// upwards, with a peak-hold LED that stays 1.5 s and then drops one step per 120 ms.
-// The white pointer on the left edge is the AGC gain (bottom x1 .. top x64).
-static void levelMeter(LovyanGFX& d, int x, int y, int w, int h) {
-  const int py = y + h - 1 - (int)(gainFrac() * (h - 2));
-  d.fillTriangle(x - 9, py - 4, x - 9, py + 4, x - 3, py, TFT_WHITE);
-  static int hold = 0;
-  static uint32_t holdSince = 0, lastDrop = 0;
-  const int segs = 16, segH = h / segs;
-  const float db = levelPeak > 0 ? 20.0f * log10f(levelPeak / 32768.0f) : -96.0f;
-  const int lit = constrain((int)lroundf((db + 48.0f) / 48.0f * segs), 0, segs);
-  const uint32_t now = millis();
-  if (lit >= hold) {
-    hold = lit;
-    holdSince = now;
-  } else if (now - holdSince > 1500 && now - lastDrop > 120) {
-    hold--;
-    lastDrop = now;
+static int32_t levelPeak[2] = {0, 0};
+static int32_t recPeak = 0;
+static void measureLevels(const int16_t* p, size_t samples) {
+  levelPeak[0] = levelPeak[1] = 0;
+  for (size_t i = 0; i < samples; ++i) {
+    const int32_t a = abs((int32_t)p[i]);
+    if (a > levelPeak[i & 1]) levelPeak[i & 1] = a;
+    if (a > recPeak) recPeak = a;
   }
-  d.fillRect(x - 2, y, w + 4, h, rgb(16, 16, 18));  // dark housing
-  for (int i = 0; i < segs; i++) {                  // i = 0 is the bottom LED
-    const uint16_t on = i >= segs - 2 ? TFT_RED : (i >= segs - 5 ? TFT_YELLOW : TFT_GREEN);
-    const uint16_t off = i >= segs - 2 ? rgb(60, 10, 10) : (i >= segs - 5 ? rgb(55, 50, 8) : rgb(10, 45, 14));
-    const int sy = y + h - (i + 1) * segH;
-    const bool isHold = hold > 0 && i == hold - 1;
-    d.fillRect(x, sy + 1, w, segH - 2, (i < lit || isHold) ? on : off);  // isHold = max LED stays lit
+}
+static void levelMeter(LovyanGFX& d, int x, int y, int w, int h, int channel) {
+  const float db = levelPeak[channel] ? 20.0f * log10f(levelPeak[channel] / 32768.0f) : -96.0f;
+  const int lit = constrain((int)((db + 48.0f) / 48.0f * 16), 0, 16);
+  for (int i = 0; i < 16; ++i) {
+    const uint16_t col = i >= 14 ? TFT_RED : (i >= 11 ? TFT_YELLOW : TFT_GREEN);
+    d.fillRect(x, y + h - (i + 1) * (h / 16), w, h / 16 - 1, i < lit ? col : TFT_DARKGREY);
   }
-  d.drawFastHLine(x - 3, py, w + 3, TFT_WHITE);  // AGC line across the meter
+  d.setTextSize(1); d.setTextColor(TFT_WHITE); d.setCursor(x, y+h+4); d.print(channel ? "R" : "L");
 }
 
 static void recScreen(uint32_t elapsedMs, const String& label, float mb, int gaps) {
@@ -416,8 +370,8 @@ static void recScreen(uint32_t elapsedMs, const String& label, float mb, int gap
   // one tape side = 60 min; the reels turn about once per 2 s like a real deck
   float progress = (s % 3600) / 3600.0f;
   cassette(d, 4, 22, 186, 92, label, TFT_RED, -(millis() % 100000) * 0.0031f, progress);
-  levelMeter(d, 210, 22, 22, 70);
-  gainBadge(d, 205, 95, 32, 19);
+  levelMeter(d, 201, 22, 12, 80, 0);
+  levelMeter(d, 221, 22, 12, 80, 1);
   footer(d, String(mb, 1) + " MB" + (gaps ? "  gaps " + String(gaps) : "") + "   type = name",
          "double-click G0 = stop");
   frameEnd(d);
@@ -494,8 +448,8 @@ static void uploadScreen(const String& name, size_t sent, size_t total, int idx,
 static bool sdBegin() {
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   if (!SD.begin(PIN_SD_CS, SPI, 25000000)) return false;
-  if (!SD.exists(REC_DIR)) SD.mkdir(REC_DIR);
-  return true;
+  if (!SD.exists("/gencord-adv") && !SD.mkdir("/gencord-adv")) return false;
+  return SD.exists(REC_DIR) || SD.mkdir(REC_DIR);
 }
 
 static void sdEnd() {
@@ -503,29 +457,25 @@ static void sdEnd() {
   SPI.end();
 }
 
-static void put16(uint8_t* p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
-static void put32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = v >> (8 * i); }
-
-static void writeWavHeader(File& f, uint32_t dataBytes) {
+static bool writeWavHeader(File& f, uint32_t dataBytes) {
   uint8_t h[44];
-  memcpy(h, "RIFF", 4);
-  put32(h + 4, 36 + dataBytes);
-  memcpy(h + 8, "WAVEfmt ", 8);
-  put32(h + 16, 16);
-  put16(h + 20, 1);  // PCM
-  put16(h + 22, 1);  // mono
-  put32(h + 24, SAMPLE_RATE);
-  put32(h + 28, SAMPLE_RATE * 2);
-  put16(h + 32, 2);
-  put16(h + 34, 16);
-  memcpy(h + 36, "data", 4);
-  put32(h + 40, dataBytes);
-  f.seek(0);
-  f.write(h, sizeof(h));
+  return gencord::wavHeader(h, dataBytes) && f.seek(0) && f.write(h, sizeof(h)) == sizeof(h);
+}
+static String uploadedMarker(const String& name) { return String(REC_DIR) + "/" + name + ".uploaded"; }
+// Actual FAT commit/rename and marker persistence still need physical SD qualification.
+static bool isUploaded(const String& name, uint32_t bytes) {
+  File marker = SD.open(uploadedMarker(name), FILE_READ);
+  if (!marker || marker.size() > 32) { marker.close(); return false; }
+  const String value = marker.readStringUntil('\n'); marker.close();
+  return bytes > 44 && (uint32_t)value.toInt() == bytes;
+}
+static bool trimFile(const String& path, uint32_t bytes) {
+  const String full = String(SD.mountpoint()) + path;
+  return truncate(full.c_str(), bytes) == 0;
 }
 
-// Lists finished recordings. With recover=true, files left as .wav.part by a
-// power loss get a correct header and become normal recordings.
+// Recovery repairs/trims the stereo file BEFORE publishing it as a finished WAV.
+// Failed/empty parts remain on SD, never masquerading as a valid upload.
 static std::vector<String> listRecordings(bool recover) {
   std::vector<String> done, parts;
   File dir = SD.open(REC_DIR);
@@ -533,41 +483,25 @@ static std::vector<String> listRecordings(bool recover) {
   for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
     String n = f.name();
     if (!f.isDirectory()) {
-      if (n.endsWith(".wav")) done.push_back(n);
+      if (n.endsWith(".wav") && !isUploaded(n, f.size())) done.push_back(n);
       else if (n.endsWith(".wav.part")) parts.push_back(n);
     }
     f.close();
   }
   dir.close();
-  if (recover) {
-    for (auto& p : parts) {
-      const String path = String(REC_DIR) + "/" + p;
-      // "x.wav.part" -> "x_recovered.wav": the cut-off recording stays recognisable on the NAS
-      const String fin = p.substring(0, p.length() - 9) + "_recovered.wav";
-      const String finPath = String(REC_DIR) + "/" + fin;
-      File probe = SD.open(path, FILE_READ);
-      const size_t sz = probe ? probe.size() : 0;
-      if (probe) probe.close();
-      if (sz <= 44) {  // cut off before the first save point: nothing to keep
-        SD.remove(path);
-        logEvent("recover_empty", p + " " + String((unsigned long)sz) + "B");
-        continue;
-      }
-      // Rename first: from then on it is a normal recording and will be uploaded,
-      // even if fixing the header below fails (the header sizes are then only
-      // those of the last save point; the pipeline's ffmpeg reads to the end anyway).
-      if (!SD.rename(path, finPath)) {
-        logEvent("recover_failed", p + " rename");
-        continue;
-      }
-      File f = SD.open(finPath, "r+");
-      if (f) {
-        writeWavHeader(f, f.size() - 44);
-        f.close();
-      }
-      done.push_back(fin);
-      logEvent("recovered", fin + " " + String((unsigned long)(sz / 1024)) + "KB" + (f ? "" : " header-not-fixed"));
-    }
+  if (!recover) return done;
+  for (auto& p : parts) {
+    const String path = String(REC_DIR) + "/" + p;
+    File f = SD.open(path, "r+");
+    if (!f || f.size() <= 44 || f.size() - 44 > gencord::MaxDataBytes) { f.close(); continue; }
+    const uint32_t bytes = ((f.size() - 44) / gencord::FrameBytes) * gencord::FrameBytes;
+    const bool headerOk = bytes && writeWavHeader(f, bytes);
+    const bool needsTrim = f.size() != 44 + bytes;
+    f.close();
+    if (!headerOk || (needsTrim && !trimFile(path, 44 + bytes))) { logEvent("recover_failed", p); continue; }
+    String fin = p.substring(0, p.length() - 9) + "_recovered.wav";
+    if (SD.exists(String(REC_DIR) + "/" + fin) || !SD.rename(path, String(REC_DIR) + "/" + fin)) continue;
+    done.push_back(fin); logEvent("recovered", fin);
   }
   return done;
 }
@@ -662,151 +596,19 @@ static void setTimeManually() {
 }
 
 // ================================================================ recording
-// The mic is captured as stereo: depending on core/driver version the Cardputer's
-// PDM mic shows up in the left or the right slot, the other one stays constant.
-// Each buffer holds BUF_SAMPLES/2 L/R frames and is reduced to mono in place.
-static constexpr size_t MONO_SAMPLES = BUF_SAMPLES / 2;
-static constexpr size_t MONO_BYTES = MONO_SAMPLES * 2;
-static int micChannel = -1;  // 0 = left, 1 = right, -1 = not decided yet
-static float hpX = 0, hpY = 0;
-static float noiseEst = 100.0f;  // tracked background-noise peak of the input
-static float agcGate = 60.0f;    // input peak needed to raise the gain
-static float agcPeakIn = 0;      // input peak of the latest block (AGC test screen)
-static bool agcSpeech = false;   // latest block was above the gate
-static int32_t recPeak = 0;  // loudest output sample of the recording (logged, for tuning agc_max)
-
-static void toMono(int16_t* p) {
-  int64_t sum[2] = {0, 0};
-  for (size_t i = 0; i < MONO_SAMPLES; i++) { sum[0] += p[2 * i]; sum[1] += p[2 * i + 1]; }
-  int32_t mean[2] = {(int32_t)(sum[0] / (int64_t)MONO_SAMPLES), (int32_t)(sum[1] / (int64_t)MONO_SAMPLES)};
-  uint64_t act[2] = {0, 0};
-  for (size_t i = 0; i < MONO_SAMPLES; i++) {
-    act[0] += abs(p[2 * i] - mean[0]);
-    act[1] += abs(p[2 * i + 1] - mean[1]);
-  }
-  int ch = act[1] > act[0] ? 1 : 0;
-  if (micUsb) {  // USB mic: mix L and R (two DJI transmitters arrive as left/right)
-    for (size_t i = 0; i < MONO_SAMPLES; i++) p[2 * i] = (int16_t)(((int32_t)p[2 * i] + p[2 * i + 1]) / 2);
-    ch = 0;
-  } else {
-  if (micChannel < 0 && (act[ch] > 4 * act[1 - ch] + 200)) micChannel = ch;  // clearly one live side
-  if (micChannel >= 0) ch = micChannel;
-  }
-  // 1) ~80 Hz high-pass: removes the PDM DC offset, rumble and handling noise.
-  float peakIn = 0;
-  for (size_t i = 0; i < MONO_SAMPLES; i++) {
-    float x = p[2 * i + ch];
-    hpY = x - hpX + 0.97f * hpY;
-    hpX = x;
-    p[i] = (int16_t)constrain(hpY, -32768.0f, 32767.0f);
-    if (fabsf(hpY) > peakIn) peakIn = fabsf(hpY);
-  }
-  // 2) Automatic gain like a dictaphone: aim the block peak at ~-9 dBFS, never more
-  //    than agc_max times. Loud blocks pull the gain down at once, voices raise it
-  //    quickly (~8 dB/s). Background noise is tracked (falls fast, rises slowly);
-  //    only blocks clearly above it (3x) may raise the gain, and the gain is capped
-  //    so the noise itself never ends up louder than ~-27 dBFS.
-  static constexpr float TARGET = 12000.0f, MIN_GATE = 60.0f, NOISE_OUT_MAX = 6000.0f;  // hiss may reach ~-15 dBFS so quiet speech still gets loud
-  if (peakIn < noiseEst) noiseEst = max(peakIn, 5.0f);
-  else noiseEst *= 1.01f;
-  agcGate = max(MIN_GATE, noiseEst * 3.0f);
-  const float maxGain = min((float)S.agcMax, NOISE_OUT_MAX / noiseEst);
-  float want = peakIn > 1.0f ? TARGET / peakIn : maxGain;
-  want = constrain(want, 1.0f, max(1.0f, maxGain));
-  const float g0 = agcGain;
-  agcSpeech = peakIn > agcGate;
-  if (want < agcGain) agcGain = want;                               // attack: loud -> down at once
-  else if (agcSpeech) agcGain = min(want, agcGain * 1.12f);         // speech: up ~8 dB/s
-  else agcGain = min(want, agcGain * 1.03f);  // quiet: drift up ~2 dB/s until the hiss hits the cap,
-                                              // so a click never leaves the gain stuck at x1
-  agcPeakIn = peakIn;
-  // 3) Apply with a ramp across the block, soft-limit above 24000.
-  int32_t blockPeak = 0;
-  for (size_t i = 0; i < MONO_SAMPLES; i++) {
-    const float g = g0 + (agcGain - g0) * (float)i / MONO_SAMPLES;
-    float y = p[i] * g;
-    const float a = fabsf(y);
-    if (a > 24000.0f) y = copysignf(24000.0f + (a - 24000.0f) * 0.25f, y);
-    const int32_t v = (int32_t)constrain(y, -32767.0f, 32767.0f);
-    if (abs(v) > blockPeak) blockPeak = abs(v);
-    p[i] = (int16_t)v;
-  }
-  levelPeak = blockPeak;
-  if (blockPeak > recPeak) recPeak = blockPeak;
-}
-
-// ---- PDM microphone via the ESP-IDF driver (M5Unified's mic path stays silent
-// on the Cardputer with this core). A task reads DMA data into free buffers.
-static i2s_chan_handle_t micRx = nullptr;
-static volatile TaskHandle_t micTask = nullptr;
-static volatile bool micRun = false;
-static volatile uint32_t micDrops = 0;
-static int16_t dropBuf[BUF_SAMPLES];  // read target while every buffer waits for the SD card
-
-static void micTaskFn(void*) {
-  while (micRun) {
-    int16_t* b = nullptr;
-    const bool have = xQueueReceive(freeQ, &b, 0) == pdTRUE;
-    size_t got = 0;
-    i2s_channel_read(micRx, have ? b : dropBuf, BUF_SAMPLES * 2, &got, pdMS_TO_TICKS(500));
-    if (!have) { micDrops++; continue; }
-    if (got == BUF_SAMPLES * 2) xQueueSend(filledQ, &b, 0);
-    else xQueueSend(freeQ, &b, 0);
-  }
-  micTask = nullptr;
-  vTaskDelete(nullptr);
-}
-
-static bool micStart() {
-  // Known Cardputer issue: stale pin state on 43/46 leaves the mic silent. Start clean.
-  gpio_hold_dis(GPIO_NUM_43);
-  gpio_reset_pin(GPIO_NUM_43);
-  gpio_reset_pin(GPIO_NUM_46);
-  delay(5);
-  i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  cc.dma_desc_num = 8;
-  cc.dma_frame_num = 256;
-  if (i2s_new_channel(&cc, nullptr, &micRx) != ESP_OK) return false;
-  i2s_pdm_rx_config_t pc;
-  memset(&pc, 0, sizeof(pc));
-  pc.clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
-  pc.slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
-  pc.gpio_cfg.clk = GPIO_NUM_43;
-  pc.gpio_cfg.din = GPIO_NUM_46;
-  if (i2s_channel_init_pdm_rx_mode(micRx, &pc) != ESP_OK || i2s_channel_enable(micRx) != ESP_OK) {
-    i2s_del_channel(micRx);
-    micRx = nullptr;
-    return false;
-  }
-  micDrops = 0;
-  micRun = true;
-  TaskHandle_t h;
-  xTaskCreatePinnedToCore(micTaskFn, "mic", 4096, nullptr, 5, &h, 0);
-  micTask = h;
-  return true;
-}
-
-static void micStop();
-
-// Recording and AGC test: the USB microphone if one answers, otherwise the built-in mic.
-// Only probed without a PC on the port (USB serial and flashing need it), ~1 s when nothing
-// is plugged in. USB host and resampling run at 160 MHz.
+// USB-only on both boards. Always probe: battery/charging and USB CDC "plugged"
+// status do NOT establish the role of an externally powered OTG receiver.
 static bool micStartAny() {
   micUsb = false;
-  if (S.usbMic && !HWCDC::isPlugged()) {
-    setCpuFrequencyMhz(160);
-    if (usbMicStart(freeQ, filledQ, BUF_SAMPLES, 1200)) {
-      micUsb = true;
-      agcGain = 1.0f;  // the receiver already delivers a full-level signal
-      return true;
-    }
-    setCpuFrequencyMhz(80);
-  }
-  return micStart();
+  setCpuFrequencyMhz(160);
+  if (usbMicStart(freeQ, filledQ, BUF_SAMPLES, 5000)) { micUsb = true; return true; }
+  setCpuFrequencyMhz(80);
+  return false;
 }
-
+static void micStop() {
+  usbMicStop(); micUsb = false; setCpuFrequencyMhz(80);
+}
 static String micSource() {
-  if (!micUsb) return "internal";
   const UsbMicInfo& m = usbMicInfo();
   char b[96];
   snprintf(b, sizeof(b), "usb %04x:%04x %s %luHz %uch %ubit", m.vid, m.pid, m.product, (unsigned long)m.rate,
@@ -825,7 +627,8 @@ static std::vector<CardFile> cardFiles() {
   File dir = SD.open(REC_DIR);
   if (!dir) return out;
   for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-    if (!f.isDirectory()) out.push_back({f.name(), (uint32_t)f.size()});
+    if (!f.isDirectory() && (String(f.name()).endsWith(".wav") || String(f.name()).endsWith(".wav.part")))
+      out.push_back({f.name(), (uint32_t)f.size()});
     f.close();
   }
   dir.close();
@@ -834,7 +637,7 @@ static std::vector<CardFile> cardFiles() {
 }
 
 static String durationOf(uint32_t bytes) {
-  uint32_t s = bytes > 44 ? (bytes - 44) / (SAMPLE_RATE * 2) : 0;
+  uint32_t s = bytes > 44 ? gencord::durationMs(bytes - 44) / 1000 : 0;
   char b[12];
   snprintf(b, sizeof(b), "%lu:%02lu", (unsigned long)(s / 60), (unsigned long)(s % 60));
   return b;
@@ -843,7 +646,7 @@ static String durationOf(uint32_t bytes) {
 // USB serial 'w': checks that a file can be reopened with "r+" and patched at offset 0
 // while keeping its length (what the recording save points rely on).
 static void serialSdTest() {
-  const char* p = "/rec/_sdtest.tmp";
+  const char* p = "/gencord-adv/recordings/_sdtest.tmp";
   File f = SD.open(p, FILE_WRITE);
   if (!f) { Serial.println("sdtest: create FAILED"); return; }
   for (int i = 0; i < 1000; i++) f.write((uint8_t)'a');
@@ -912,174 +715,30 @@ static void listScreen() {
   }
 }
 
-// Two short beeps. The speaker amp shares GPIO43 with the mic clock, so the mic is
-// paused for the beep (DMA buffers keep the WAV continuous apart from ~0.3 s).
-static void lowBattBeep() {
-  const bool wasRunning = micRx != nullptr;
-  if (wasRunning) micStop();
-  M5.Speaker.begin();
-  M5.Speaker.setVolume(160);
-  for (int i = 0; i < 2; i++) {
-    M5.Speaker.tone(2200, 90);
-    delay(150);
-  }
-  M5.Speaker.end();
-  if (wasRunning) micStart();
-}
-
-// USB serial self-test (send 'm'): 2 s of raw PDM data, per-slot statistics, plus
-// how often the data pin toggles. A dead mic shows constant values / 0 toggles.
-static void micSelfTest() {
-  xQueueReset(filledQ);
-  xQueueReset(freeQ);
-  for (int i = 0; i < NBUF; i++) {
-    int16_t* p = bufs[i];
-    xQueueSend(freeQ, &p, 0);
-  }
-  const bool ok = micStart();
-  Serial.printf("mic start: %s\n", ok ? "ok" : "FAILED");
-  if (!ok) return;
-  uint32_t toggles = 0;
-  int last = gpio_get_level(GPIO_NUM_46);
-  for (int i = 0; i < 20000; i++) {
-    int v = gpio_get_level(GPIO_NUM_46);
-    if (v != last) toggles++;
-    last = v;
-  }
-  Serial.printf("GPIO46 toggles in 20000 reads: %lu\n", (unsigned long)toggles);
-  uint32_t t0 = millis();
-  int n = 0;
-  while (millis() - t0 < 2000) {
-    int16_t* p;
-    if (xQueueReceive(filledQ, &p, pdMS_TO_TICKS(100)) != pdTRUE) continue;
-    int16_t mn[2] = {32767, 32767}, mx[2] = {-32768, -32768};
-    for (size_t i = 0; i < BUF_SAMPLES; i++) {
-      int c = i & 1;
-      if (p[i] < mn[c]) mn[c] = p[i];
-      if (p[i] > mx[c]) mx[c] = p[i];
-    }
-    if (n++ % 2 == 0)
-      Serial.printf("blk %2d  L %6d..%6d   R %6d..%6d   first %d %d %d %d\n", n, mn[0], mx[0], mn[1], mx[1], p[0], p[1],
-                    p[2], p[3]);
-    xQueueSend(freeQ, &p, 0);
-  }
-  Serial.printf("blocks %d, drops %lu\n", n, (unsigned long)micDrops);
-  micStop();
-}
-
-static void micStop();
-
-// Horizontal level bar, -60..0 dBFS, optional marker (e.g. the noise gate).
-static void dbBar(LovyanGFX& d, int x, int y, int w, int h, float level, uint16_t col, float marker = -1) {
-  auto pos = [&](float v) {
-    float db = v > 0 ? 20.0f * log10f(v / 32768.0f) : -96.0f;
-    return (int)(constrain((db + 60.0f) / 60.0f, 0.0f, 1.0f) * w);
-  };
-  d.fillRoundRect(x, y, w, h, 3, rgb(40, 40, 46));
-  const int p = pos(level);
-  if (p > 0) d.fillRoundRect(x, y, p, h, 3, col);
-  if (marker > 0) d.fillRect(x + pos(marker) - 1, y - 2, 3, h + 4, TFT_ORANGE);
-}
-
-// Menu 'a': live view of the automatic gain, nothing is recorded. Shows the gain,
-// the raw microphone level (orange mark = noise gate), the level after the AGC and
-// a 12 s history (green = output level, yellow = gain). Any key or G0 = back.
-static void agcTest() {
-  xQueueReset(filledQ);
-  xQueueReset(freeQ);
-  for (int i = 0; i < NBUF; i++) {
-    int16_t* p = bufs[i];
-    xQueueSend(freeQ, &p, 0);
-  }
-  micChannel = -1;
-  hpX = hpY = 0;
-  agcGain = 4.0f;
-  noiseEst = 100.0f;
-  if (!micStartAny()) {
-    ui("MIC ERROR", TFT_RED, "could not start mic");
-    delay(2000);
-    return;
-  }
+// Menu 'a': independent channel levels, unity gain. No internal mic diagnostics.
+static void stereoTest() {
+  xQueueReset(filledQ); xQueueReset(freeQ);
+  for (int i = 0; i < NBUF; ++i) { int16_t* p = bufs[i]; xQueueSend(freeQ, &p, 0); }
   screenOn();
-  static constexpr int H = 96;
-  uint8_t histOut[H] = {0}, histGain[H] = {0};
-  int head = 0, skip = 1;
-  uint32_t lastDraw = 0;
+  ui("USB PROBE", TFT_CYAN, "Need 2ch receiver", "Receiver: STEREO, not mono");
+  if (!micStartAny()) { ui("USB ERROR", TFT_RED, usbMicError(), "No internal fallback"); delay(3000); return; }
   for (;;) {
-    int16_t* p;
-    if (xQueueReceive(filledQ, &p, pdMS_TO_TICKS(20)) == pdTRUE) {
-      if (skip > 0) skip--;  // power-up click
-      else {
-        toMono(p);
-        float db = levelPeak > 0 ? 20.0f * log10f(levelPeak / 32768.0f) : -60.0f;
-        histOut[head] = (uint8_t)constrain((db + 60.0f) / 60.0f * 30.0f, 0.0f, 30.0f);
-        histGain[head] = (uint8_t)constrain(log2f(agcGain) / 6.0f * 30.0f, 0.0f, 30.0f);  // x1..x64
-        head = (head + 1) % H;
-      }
-      xQueueSend(freeQ, &p, 0);
+    AudioBlock block;
+    if (xQueueReceive(filledQ, &block, pdMS_TO_TICKS(20)) == pdTRUE) {
+      measureLevels(block.data, block.samples); xQueueSend(freeQ, &block.data, 0);
+      ui("USB L / R", TFT_CYAN, "L peak " + String(levelPeak[0]), "R peak " + String(levelPeak[1]), "Unity gain; no mixing", "Any key = back");
     }
     M5Cardputer.update();
-    const bool keyDown = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
-    if (keyDown || M5.BtnA.wasClicked()) break;
-    if (millis() - lastDraw < 100) continue;
-    lastDraw = millis();
-
-    LovyanGFX& d = frameBegin();
-    d.setTextSize(2);
-    d.setTextColor(TFT_CYAN);
-    d.setCursor(4, 3);
-    d.print("AGC TEST");
-    d.setTextColor(TFT_WHITE);
-    d.setCursor(186, 3);
-    d.print(String(battPct()) + "%");
-    micIcon(d, 170, 14);
-    d.setTextSize(4);
-    d.setTextColor(TFT_YELLOW);
-    d.setCursor(4, 24);
-    d.print("x" + String(agcGain, agcGain < 10 ? 1 : 0));
-    d.setTextSize(1);
-    d.setTextColor(TFT_WHITE);
-    d.setCursor(124, 26);
-    d.print(micUsb ? "IN  (USB mic)" : "IN  (mic)");
-    dbBar(d, 124, 36, 112, 8, agcPeakIn, rgb(160, 160, 170), agcGate);
-    d.setCursor(124, 48);
-    d.print("OUT (file)");
-    dbBar(d, 124, 58, 112, 8, levelPeak, TFT_GREEN);
-    // history graph: newest on the right
-    const int gx = 4, gy = 72, gw = H * 2 + 40, gh = 32;
-    d.drawRect(gx, gy, gw, gh, rgb(70, 70, 80));
-    for (int i = 0; i < H; i++) {
-      const int k = (head + i) % H;
-      const int x = gx + 1 + i * (gw - 2) / H;
-      d.drawFastVLine(x, gy + gh - 1 - histOut[k], histOut[k], TFT_GREEN);
-      d.drawPixel(x, gy + gh - 1 - histGain[k], TFT_YELLOW);
-      d.drawPixel(x + 1, gy + gh - 1 - histGain[k], TFT_YELLOW);
-    }
-    footer(d, agcSpeech ? "speech: gain follows voice" : "quiet: gain drifts up (cap = hiss)",
-           "noise " + String((int)noiseEst) + "  gate " + String((int)agcGate) + "   any key = back");
-    frameEnd(d);
+    if (usbMicLost() || M5.BtnA.wasClicked() || (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())) break;
   }
-  micStop();
-}
-
-static void micStop() {
-  if (micUsb) {
-    usbMicStop();
-    micUsb = false;
-    setCpuFrequencyMhz(80);
-    return;
-  }
-  if (!micRx) return;
-  micRun = false;
-  while (micTask) vTaskDelay(pdMS_TO_TICKS(5));
-  i2s_channel_disable(micRx);
-  i2s_del_channel(micRx);
-  micRx = nullptr;
+  const bool error = usbMicLost(); micStop();
+  if (error) { ui("USB ERROR", TFT_RED, usbMicError()); delay(3000); }
 }
 
 struct RecResult {
   bool ok = false;
   bool lowBatt = false;
+  bool audioError = false;
 };
 
 static RecResult recordSession() {
@@ -1101,7 +760,10 @@ static RecResult recordSession() {
   char base[48];
   if (timeValid()) strncpy(base, timeStr("%Y-%m-%d_%H-%M-%S").c_str(), sizeof(base));
   else snprintf(base, sizeof(base), "notime_%lu_%lu", (unsigned long)rtcBoots, (unsigned long)millis());
-  String partPath = String(REC_DIR) + "/" + base + ".wav.part";
+  String stem = base;
+  for (unsigned n = 1; SD.exists(String(REC_DIR) + "/" + stem + ".wav") ||
+                         SD.exists(String(REC_DIR) + "/" + stem + ".wav.part"); ++n) stem = String(base) + "_" + String(n);
+  String partPath = String(REC_DIR) + "/" + stem + ".wav.part";
 
   File f = SD.open(partPath, FILE_WRITE);
   if (!f) {
@@ -1109,7 +771,7 @@ static RecResult recordSession() {
     delay(3000);
     return r;
   }
-  writeWavHeader(f, 0);
+  bool writeErr = !writeWavHeader(f, 0);
   uint32_t dataBytes = 0;
 
   xQueueReset(filledQ);
@@ -1118,15 +780,13 @@ static RecResult recordSession() {
     int16_t* p = bufs[i];
     xQueueSend(freeQ, &p, 0);
   }
-  micChannel = -1;
-  hpX = hpY = 0;
-  agcGain = 4.0f;
-  noiseEst = 100.0f;
   recPeak = 0;
+  ui("USB PROBE", TFT_CYAN, "Need 2ch receiver", "Receiver: STEREO, not mono");
+
   if (!micStartAny()) {
     f.close();
     SD.remove(partPath);
-    ui("MIC ERROR", TFT_RED, "could not start mic");
+    ui("USB ERROR", TFT_RED, usbMicError(), "No internal fallback");
     delay(3000);
     return r;
   }
@@ -1134,33 +794,29 @@ static RecResult recordSession() {
 
   const uint32_t t0 = millis();
   uint32_t lastHdr = t0, lastBatt = t0, lastBlink = 0, lastDraw = 0, screenUntil = t0 + 2500;
-  uint32_t gaps = 0, buffersSeen = 0, lastWarn = 0, lostDrops = 0;
-  bool writeErr = false, ledOn = false;
+  uint32_t gaps = 0, lastWarn = 0;
+  bool ledOn = false, limitReached = false;
+  auto saveBlock = [&](const AudioBlock& block) {
+    const size_t requested = min(block.samples * sizeof(int16_t), (size_t)(gencord::MaxDataBytes - dataBytes));
+    if (!writeErr && requested) {
+      measureLevels(block.data, requested / sizeof(int16_t));
+      const size_t w = f.write((const uint8_t*)block.data, requested);
+      dataBytes += (w / gencord::FrameBytes) * gencord::FrameBytes;
+      if (w != requested) writeErr = true;
+    }
+    if (dataBytes >= gencord::MaxDataBytes) limitReached = true;
+    xQueueSend(freeQ, &block.data, 0);
+  };
   String recName;
   const uint32_t ignoreBtnUntil = t0 + 800;  // the press that woke us must not count as a click
 
   for (;;) {
-    int16_t* p;
-    while (xQueueReceive(filledQ, &p, 0) == pdTRUE) {
-      if (buffersSeen++ > 0) {  // the first 125 ms carry the mic's power-up click
-        toMono(p);
-        size_t w = f.write((const uint8_t*)p, MONO_BYTES);
-        dataBytes += w;
-        if (w != MONO_BYTES) writeErr = true;
-      }
-      xQueueSend(freeQ, &p, 0);
-    }
-    if (micUsb && usbMicLost()) {  // receiver unplugged or its battery died: carry on with the built-in mic
-      lostDrops += usbMicDrops();
-      micStop();
-      logEvent("usb_mic_lost", base);
-      micChannel = -1;
-      agcGain = 4.0f;
-      if (!micStart()) break;
-      screenOn();
-      screenUntil = millis() + 3000;
-    }
-    gaps = lostDrops + (micUsb ? usbMicDrops() : micDrops);  // 250 ms blocks lost while the SD card stalled
+    AudioBlock block;
+    while (!writeErr && !limitReached && xQueueReceive(filledQ, &block, 0) == pdTRUE) saveBlock(block);
+    if (usbMicLost()) { r.audioError = true; logEvent("usb_error", usbMicError()); break; }
+    gaps = usbMicDrops();
+    if (limitReached) break;
+
 
     M5Cardputer.update();
     const uint32_t now = millis();
@@ -1188,7 +844,7 @@ static RecResult recordSession() {
       if (now > screenUntil) {
         screenOff();
       } else if (now - lastDraw > 120) {  // ~8 fps: enough for turning reels
-        recScreen(now - t0, recName.length() ? recName + "_" : String(base), dataBytes / 1048576.0f, gaps);
+        recScreen(gencord::durationMs(dataBytes), recName.length() ? recName + "_" : String(base), dataBytes / 1048576.0f, gaps);
         lastDraw = now;
       }
     }
@@ -1198,12 +854,11 @@ static RecResult recordSession() {
     // entry (the file length stays 44 bytes until close), so the file is closed and
     // reopened; the mic keeps filling its buffers meanwhile.
     if (now - lastHdr > (dataBytes < 100000 ? 2000u : 10000u)) {
-      writeWavHeader(f, dataBytes);
+      if (!writeWavHeader(f, dataBytes)) writeErr = true;
       f.close();
       f = SD.open(partPath, "r+");
-      if (!f) f = SD.open(partPath, FILE_APPEND);
       if (!f) writeErr = true;
-      else f.seek(44 + dataBytes);
+      else if (!f.seek(44 + dataBytes)) writeErr = true;
       lastHdr = now;
     }
     if (now - lastBlink > 5000) {  // short dim red blink = "still recording"
@@ -1221,7 +876,7 @@ static RecResult recordSession() {
         break;
       }
       if (mv > 1000 && mv < LOW_BATT_WARN_MV && now - lastWarn > 60000) {
-        lowBattBeep();  // ~0.3 s gap in the recording: speaker and mic share GPIO43
+        // Visual warning only: never reconfigure codec/USB while capturing.
         screenOn();
         screenUntil = millis() + 3000;
         lastWarn = now;
@@ -1232,40 +887,40 @@ static RecResult recordSession() {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 
-  const char* srcAtStop = micUsb ? "usb" : "internal";
+  // Stop producer, then drain all completed and partial output blocks before header finalization.
   micStop();
+  if (usbMicLost()) r.audioError = true;
   M5.Led.setAllColor(0, 0, 0);
-  int16_t* p;
-  while (xQueueReceive(filledQ, &p, 0) == pdTRUE) {
-    toMono(p);
-    dataBytes += f.write((const uint8_t*)p, MONO_BYTES);
-  }
-  writeWavHeader(f, dataBytes);
+  AudioBlock block;
+  while (xQueueReceive(filledQ, &block, 0) == pdTRUE) saveBlock(block);
+  if (!writeWavHeader(f, dataBytes)) writeErr = true;
+  const bool needsTrim = f && f.size() != 44 + dataBytes;
   f.close();
-
-  const uint32_t secs = (millis() - t0) / 1000;
+  if (needsTrim && !trimFile(partPath, 44 + dataBytes)) writeErr = true;
+  const uint32_t secs = gencord::durationMs(dataBytes) / 1000;
   screenOn();
-  if (millis() - t0 < 1000 && !r.lowBatt && !writeErr) {  // accidental tap only; 1 s+ is always kept
-    SD.remove(partPath);
-    logEvent("rec_discarded", base);
-    ui("TOO SHORT", TFT_ORANGE, "under 1 s: not saved");
-    delay(1500);
-    return r;
+  if (!dataBytes) {
+    logEvent("rec_empty", stem);
+    ui("NOT SAVED", TFT_RED, r.audioError ? usbMicError() : "No complete audio frames", "Empty .part retained on SD");
+    delay(3000); return r;
   }
-  String name;
-  if (!r.lowBatt && !writeErr) name = textInput("Name?", NAME_TIMEOUT_S * 1000UL, Input::Name, 40, recName);
-  else name = recName;
-  String finalName = String(base) + (name.length() ? "_" + name : "") + ".wav";
-  if (!SD.rename(partPath, String(REC_DIR) + "/" + finalName)) finalName = String(base) + ".wav.part";
-  logEvent(writeErr ? "rec_stop_sd_full" : (r.lowBatt ? "rec_stop_lowbatt" : "rec_stop"),
-           finalName + " " + String(secs) + "s gaps=" + String(gaps) + " mic_ch=" + String(micChannel) + " src=" + String(srcAtStop) + " peak=" + String(recPeak));
-
+  String name = recName;
+  if (!r.lowBatt && !writeErr && !r.audioError && !limitReached)
+    name = textInput("Name?", NAME_TIMEOUT_S * 1000UL, Input::Name, 40, recName);
+  String finalName = stem + (name.length() ? "_" + name : "") + (r.audioError ? "_usb_error" : "") + ".wav";
+  const String finalPath = String(REC_DIR) + "/" + finalName;
+  if (writeErr || SD.exists(finalPath) || !SD.rename(partPath, finalPath)) {
+    writeErr = true; finalName = stem + ".wav.part";
+  }
+  logEvent(writeErr ? "rec_sd_error" : (r.audioError ? "rec_usb_error" : "rec_stop"),
+           finalName + " " + String(secs) + "s src=usb2 peak=" + String(recPeak));
   rtcPending = listRecordings(false).size();
-  ui(writeErr ? "SD FULL" : (r.lowBatt ? "LOW BATT" : "SAVED"), writeErr || r.lowBatt ? TFT_RED : TFT_GREEN,
-     finalName.substring(0, 19), finalName.length() > 19 ? finalName.substring(19, 38) : "",
-     String(secs / 60) + " min " + String(secs % 60) + " s");
-  delay(1500);
-  r.ok = true;
+  ui(writeErr ? "SD ERROR" : (r.audioError ? "USB ERROR" : (limitReached ? "60 MIN LIMIT" : "SAVED")),
+     writeErr || r.audioError || r.lowBatt ? TFT_RED : TFT_GREEN,
+     writeErr ? "SD ERROR" : (r.audioError ? usbMicError() : (r.lowBatt ? "Stopped: low battery" : finalName.substring(0, 26))),
+     String(secs / 60) + " min " + String(secs % 60) + " s stereo", "Original kept on SD");
+  delay(r.audioError ? 5000 : 1500);
+  r.ok = !writeErr;
   return r;
 }
 
@@ -1632,7 +1287,14 @@ static void uploadConnected(bool interactive, bool needTime) {
     upIdx++;
     upLastDraw = 0;
     if (uploadOne(name, err)) {
-      SD.remove(String(REC_DIR) + "/" + name);
+      File original = SD.open(String(REC_DIR) + "/" + name, FILE_READ);
+      const uint32_t bytes = original ? original.size() : 0;
+      original.close();
+      File marker = SD.open(uploadedMarker(name), FILE_WRITE);
+      if (bytes <= 44 || !marker || marker.println(String(bytes)) == 0) {
+        marker.close(); err = "SD upload marker"; failed++; break;
+      }
+      marker.close();
       logEvent("upload_ok", name);
       done++;
     } else if (uploadAbort) {
@@ -1645,12 +1307,8 @@ static void uploadConnected(bool interactive, bool needTime) {
     }
     if (uploadAbort) break;
   }
-  // Device log next to the recordings (overwritten each sync, never deleted locally).
-  File lf = uploadAbort ? File() : SD.open(LOG_PATH, FILE_READ);
-  if (lf) {
-    davRequest("PUT", dav.path + "/_gencord_log.csv", "Content-Type: text/csv\r\n", &lf);
-    lf.close();
-  }
+  // Private SD log is not uploaded: receiver accepts WAV only.
+
   wifiOff();
   setCpuFrequencyMhz(80);
 
@@ -1693,9 +1351,7 @@ static void loadSettings() {
     else if (k == "dav_pass") S.davPass = v;
     else if (k == "tz") S.tz = v;
     else if (k == "ntp") S.ntp = v;
-    else if (k == "agc_max") S.agcMax = constrain(v.toInt(), 1, 255);  // old "mic_gain" is ignored on purpose
     else if (k == "wifi_check_min") S.wifiCheckMin = constrain(v.toInt(), 1, 1440);
-    else if (k == "usb_mic") S.usbMic = v.toInt() != 0;
   }
   f.close();
 }
@@ -1713,10 +1369,8 @@ static bool saveSettings() {
   f.println("dav_pass=" + S.davPass);
   f.println("tz=" + S.tz);
   f.println("ntp=" + S.ntp);
-  f.println("agc_max=" + String(S.agcMax));
   f.println("wifi_check_min=" + String(S.wifiCheckMin));
-  f.println("# 1 = record from a USB mic (DJI receiver) on USB-C when one is plugged in");
-  f.println("usb_mic=" + String(S.usbMic ? 1 : 0));
+  f.println("# USB-only stereo capture; no internal mic, no AGC");
   f.close();
   return true;
 }
@@ -1823,12 +1477,12 @@ static void drawMenu() {
   // Red "~" = only the last saved time, may be off; red "TIME NOT SET" = nothing known.
   menuScreen(timeValid() ? (rtcTimeExact ? "" : "~") + timeStr("%H:%M %d.%m.") : "TIME NOT SET",
              timeValid() && rtcTimeExact ? TFT_WHITE : TFT_RED, label,
-             info, "(G0)rec (u)p (l)ist (o)ff (t)ime (a)gc");
+             info, "(G0)rec (u)p (l)ist (o)ff (t)ime (a)levels");
 }
 
 // After a recording: look for home Wi-Fi in the background; the menu stays usable.
 static void afterRecording(const RecResult& r) {
-  if (r.ok && !r.lowBatt) startBackgroundCheck();
+  if (r.ok && !r.lowBatt && !r.audioError) startBackgroundCheck();
 }
 
 static void recordNow() {
@@ -1848,7 +1502,7 @@ static void menuLoop() {
     const bool keyDown = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
     if (Serial.available()) {  // USB diagnostics: 'm' = microphone self-test
       const int cmd = Serial.read();
-      if (cmd == 'm') micSelfTest();
+      if (cmd == 'm') stereoTest();
       else if (cmd == 'l') serialListCard();
       else if (cmd == 'w') serialSdTest();
       else if (cmd == 'F') {  // the PC is about to flash: say so on the screen
@@ -1884,7 +1538,7 @@ static void menuLoop() {
       else if (k == 't') setTimeManually();
       else if (k == 'c') setupWizard();
       else if (k == 'l') listScreen();
-      else if (k == 'a') agcTest();
+      else if (k == 'a') stereoTest();
       else if (k == 'o' || k == 's') sleepUntilButton();
       acted = true;
     }
@@ -1921,11 +1575,16 @@ void setup() {
   rtc_gpio_deinit(PIN_BTN);
 
   auto cfg = M5.config();
-  cfg.internal_spk = true;   // only for the low-battery beep; shares GPIO43 with the mic (see lowBattBeep)
-  cfg.internal_mic = false;  // the mic is driven directly (micStart)
+  cfg.internal_spk = false;  // ADV codec is not part of USB capture
+  cfg.internal_mic = false;  // USB only; do not configure original PDM or ADV codec
   cfg.internal_imu = false;
   cfg.internal_rtc = false;
+  // M5Unified detects original vs ADV; M5Cardputer 1.1.1 selects IOMatrix vs TCA8418.
   M5Cardputer.begin(cfg, true);
+  if (M5.getBoard() != m5::board_t::board_M5CardputerADV && M5.getBoard() != m5::board_t::board_M5Cardputer) {
+    screenOn(); ui("BOARD ERROR", TFT_RED, "Cardputer / ADV required");
+    for (;;) delay(1000);
+  }
   Serial.begin(115200);  // USB CDC: diagnostics only
   M5.Display.setBrightness(0);
   M5.Display.setRotation(1);
@@ -1938,8 +1597,9 @@ void setup() {
   rtcBoots++;
   setCpuFrequencyMhz(80);
 
-  filledQ = xQueueCreate(NBUF, sizeof(int16_t*));
+  filledQ = xQueueCreate(NBUF, sizeof(AudioBlock));
   freeQ = xQueueCreate(NBUF, sizeof(int16_t*));
+  if (!filledQ || !freeQ) { screenOn(); ui("RAM ERROR", TFT_RED, "Audio queues unavailable"); for (;;) delay(1000); }
   parseDavUrl();
   const bool restoredClock = restoreClock();
   if (sdOk) rtcPending = listRecordings(true).size();
