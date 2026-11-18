@@ -1,111 +1,51 @@
-# gencord
+# gencord ADV — independent DJI microphone channels
 
-A pocket voice recorder for the **original M5Stack Cardputer**, with a fully local AI pipeline:
-record on the device, upload over your home Wi-Fi to your own server (WebDAV), and get a
-transcribed, summarised Markdown note in your **Obsidian** vault. No cloud, no subscription.
+A focused adaptation of [genkigenki/gencord](https://github.com/genkigenki/gencord) for **M5Stack Cardputer ADV** and a USB DJI Mic Mini receiver with two transmitters.
 
-```
-Cardputer ──WebDAV──▶ NAS / Nextcloud / any WebDAV ──▶ pipeline (Docker, NVIDIA GPU) ──▶ Obsidian note
- records WAV            only on your home Wi-Fi          Whisper + local LLM + speakers
-```
+**Test firmware, not yet physically qualified.** Compilation and host tests do not prove USB compatibility with a particular receiver/cable/power arrangement.
 
-## Device
+## Contract
 
-- **Record with one button:** G0 starts a recording, from sleep too. Double-click G0 stops it.
-- **Retro cassette screen:** spinning reels, an LED VU meter with peak hold and an AGC pointer,
-  a coloured gain badge (`x1` green … `x64` red) and a recording timer.
-- **Automatic gain (AGC):** tracks the noise floor, so quiet voices get loud and background
-  hiss is not pumped up.
-- **Name your recording** by typing while recording, or right after stopping.
-- **Safe on the SD card:** a save point every 10 s. Cut-off recordings are repaired as
-  `…_recovered.wav`.
-- **Upload only at home:** the device scans briefly for your Wi-Fi in the background. It
-  uploads to WebDAV, checks the size, renames the file and only then deletes it locally.
-  Away from home the radio stays off.
-- **Clock:** NTP when at home. The last known time is remembered; red `~` means not synced yet.
-- **Battery:** beeps when low and saves the recording before the battery is empty.
-  Light sleep between uses.
-- **USB microphone (experimental):** a USB audio device on the USB-C port, such as the DJI
-  Mic Mini 2 receiver, replaces the built-in mic. When a recording starts on battery, gencord
-  looks for one for about 1 s; a cyan mic icon shows it is in use. Two transmitters are mixed
-  to mono. If the device goes away, the recording continues on the built-in mic.
-  **The Cardputer does not supply 5 V on USB-C**, and the DJI receiver only connects when the
-  port has 5 V, even the model with a battery. Use a USB-C OTG splitter with a charging input
-  (power bank → splitter), or feed 5 V from the Grove port. gencord does not search while a
-  PC is connected, so USB serial and flashing keep working. `usb_mic=0` turns it off.
-- **Keys:** `(G0)rec (u)pload (l)ist (o)ff (t)ime (a)gc` and `c` for setup.
+- USB-only recording: require a supported **two-channel** USB audio stream.
+- Preserve left/right independently in a **16 kHz, PCM16 stereo WAV** on microSD.
+- No mixing to mono, no silent fallback to the internal microphone.
+- Stop/finalize visibly on capture failure; retain original SD recordings after upload.
+- The receiver must be set to **S (Stereo)**. Two reported USB channels alone cannot distinguish S from a mono mix duplicated across L/R.
+- Isolate this recorder's configuration and recordings from other firmware's SD data.
 
-### Install
+## Existing archive integration
 
-gencord runs from an app slot of [M5Launcher](https://github.com/bmorcelli/Launcher), or stand-alone.
-Both images are on the [Releases page](../../releases).
+[`receiver/`](receiver/) is a narrow authenticated local-network WebDAV receiver, compatible with the firmware's PUT → HEAD → MOVE → HEAD protocol. It validates stereo PCM and publishes:
 
-- **M5Launcher:** copy `gencord.bin` to the SD card and install it from the Launcher
-  (SD → Install), or upload it through the Launcher WebUI (OTA).
-- **M5Burner:** search for "gencord" (once listed). It flashes the full image.
-- **esptool, launcher layout:** write `gencord.bin` to the app slot. In the stock layout
-  that is ota_0 at `0x170000`; check your partition table, the Launcher can move slots.
-  ```
-  esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x170000 gencord.bin
-  ```
-- **esptool, full install** (replaces everything, the Launcher included):
-  ```
-  esptool --chip esp32s3 --port COM5 --baud 921600 write-flash 0x0 gencord.full.bin
-  ```
-- **Build yourself:** `pio run -e cardputer` (PlatformIO, pioarduino platform; see `platformio.ini`).
-  `tools/flash_once.py` flashes only when the running gencord answers `FLASH-OK`, so it never
-  cuts off a recording.
+- `*-TX1.wav`: first channel, unchanged sample values;
+- `*-TX2.wav`: second channel, unchanged sample values;
+- `*-stereo.wav.source`: byte-identical stereo original with a non-audio suffix;
+- provenance JSON with channel mapping and hashes.
 
-For download mode, hold G0, press reset, then release G0.
+An existing recursive local transcription pipeline can process the two mono WAVs separately. The non-audio `.source` suffix avoids accidentally transcribing a mixed version a third time. The receiver itself **does not perform ASR or claim transcripts are ready**.
 
-### First setup
+Basic authentication over plain HTTP is suitable only for an explicitly trusted LAN; it does not encrypt credentials/audio. Do not expose it publicly. The firmware must not be configured with a shared personal Nextcloud password: use scoped receiver credentials, stored outside source control.
 
-Press **`c`** on the device and enter:
-- Wi-Fi name and password
-- WebDAV URL, user and password
+## Power
 
-The settings are stored in `recorder.cfg` on the SD card. You can also edit that file on a PC:
+Use a proper USB OTG host/data adapter with a designed external-power input. Upstream documents that the Cardputer USB-C does not provide VBUS to the receiver. A random USB-C charging splitter is not equivalent. Neither the concrete adapter nor actual DJI USB descriptors have been physically verified here.
 
-```
-wifi_ssid=MyHomeWifi
-wifi_pass=secret
-dav_url=http://192.168.1.10:5005/Recordings/inbox
-dav_user=recorder
-dav_pass=secret
-tz=CET-1CEST,M3.5.0,M10.5.0/3
-ntp=pool.ntp.org
-agc_max=64
-wifi_check_min=20
-usb_mic=1
-```
+## Build, tests and operation
 
-WebDAV examples:
-- Synology: package "WebDAV Server", port 5005 (http) or 5006 (https).
-- Nextcloud: `https://cloud.example.org/remote.php/dav/files/USER/Recordings`.
+- [Russian owner quickstart](ADV-QUICKSTART.ru.md)
+- [Firmware build report](BUILD-REPORT.md)
+- [Firmware action log](ACTIONS-firmware.md)
+- [Receiver setup and tests](receiver/README.md)
+- [Verification boundaries](QUALIFICATION.md)
 
-Without any setup gencord is simply an offline recorder; nothing leaves the SD card.
+The upstream MIT license remains in [LICENSE](LICENSE). The vendored Espressif USB Host UAC component has its own Apache-2.0 license. Original upstream history and features remain available through Git; old generic flashing instructions are not safe for a customized owner partition table.
 
-Hardware: Cardputer v1 (StampS3, ESP32-S3FN8, 8 MB flash), microSD card (FAT32).
-Not tested on the Cardputer ADV.
+## Installation safety
 
-## Pipeline (optional)
+**Do not flash a merged/full image, erase flash or use an address copied from upstream instructions.** This application does not run as a Nucleo `.nap` plugin. It needs its own sufficiently large executable app partition, or an explicitly approved replacement of an existing application.
 
-[`pipeline/`](pipeline/) is a Docker stack (Portainer or `docker compose`) for a PC with an NVIDIA GPU.
-For every new recording in the inbox it does the following:
+Discover the actual device and current partition map, verify an exact rollback backup, select the authorized target, and install **app-only** with readback verification. A saved historical map is not a fresh on-device read. No automatic installer in this repository is authorization to replace another firmware.
 
-- transcribes with **faster-whisper large-v3-turbo**, using hints from your word list and a repetition guard;
-- separates **speakers** with pyannote. This needs a free Hugging Face token. A speaker is named
-  automatically when someone addresses them by name;
-- summarises with a **local LLM** (LM Studio or Ollama), using a template per recording type:
-  meeting, call, conversation, memo or talk. The note gets decisions, tasks as checkboxes and open questions;
-- writes a **Markdown note** into your vault, with frontmatter, people as `[[links]]` and a
-  transcript in paragraphs. On Windows, a timestamp click opens the recording in **VLC** at
-  that second (`tools/install-gencord-links.ps1`);
-- archives the audio as small Opus/OGG files (about 14 MB per hour).
+## Physical acceptance still required
 
-See [pipeline/README.md](pipeline/README.md) for setup.
-
-## Licence
-
-MIT, see [LICENSE](LICENSE). `lib/usb_host_uac` is Espressif's USB Host UAC driver (Apache-2.0,
-[lib/usb_host_uac/LICENSE](lib/usb_host_uac/LICENSE)). The pyannote models have their own terms on Hugging Face.
+ADV keyboard/display/SD; powered USB receiver enumeration; one-transmitter-at-a-time separation; disconnect finalization; actual Wi-Fi upload with SD retention; archive synchronization; and two real channel transcripts from the existing ASR runtime. Until those pass, do not use this as the only recorder for important conversations.

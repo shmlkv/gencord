@@ -1208,29 +1208,35 @@ static void stream_rx_xfer_done(usb_transfer_t *in_xfer)
             uac_host_user_interface_callback(iface, UAC_HOST_DEVICE_EVENT_RX_DONE);
         }
 
-        // if ringbuffer overflow (happens if user not read in above callback), the data will be dropped
+        // gencord ADV: any lost/malformed packet is terminal, never a silent gap
+        // or a byte-offset shift swapping the two transmitters. Validate the whole
+        // URB before publishing any of its packets.
         data_len = _ring_buffer_get_len(iface->ringbuf);
         if (data_len + in_xfer->actual_num_bytes > iface->ringbuf_size) {
-            ESP_LOGD(TAG, "RX Ringbuffer overflow");
-        } else {
-            // else push data to ringbuffer
-            for (int i = 0; i < in_xfer->num_isoc_packets; i++) {
-                if (in_xfer->isoc_packet_desc[i].status != USB_TRANSFER_STATUS_COMPLETED) {
-                    // copy data to ringbuffer
-                    ESP_LOGD(TAG, "Bad RX Isoc packet %d status %d", i, in_xfer->isoc_packet_desc[i].status);
-                    continue;
-                }
-                int requested_num_bytes = in_xfer->isoc_packet_desc[i].num_bytes;
-                int actual_num_bytes = in_xfer->isoc_packet_desc[i].actual_num_bytes;
-                // in UAC, the actual_num_bytes may less than requested_num_bytes
-                // eg. the packet_size is 64, but the endpoint size is 100
-                assert(requested_num_bytes >= actual_num_bytes);
-                // copy data to ringbuffer
-                _ring_buffer_push(iface->ringbuf, in_xfer->data_buffer + i * requested_num_bytes, actual_num_bytes, 0);
+            uac_host_user_interface_callback(iface, UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR);
+            return;
+        }
+        for (int i = 0; i < in_xfer->num_isoc_packets; i++) {
+            const int actual = in_xfer->isoc_packet_desc[i].actual_num_bytes;
+            if (in_xfer->isoc_packet_desc[i].status != USB_TRANSFER_STATUS_COMPLETED ||
+                actual < 0 || actual > in_xfer->isoc_packet_desc[i].num_bytes ||
+                !iface->packet_frame_size || actual % iface->packet_frame_size) {
+                uac_host_user_interface_callback(iface, UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR);
+                return;
             }
         }
-        // Relaunch transfer
-        usb_host_transfer_submit(in_xfer);
+        for (int i = 0; i < in_xfer->num_isoc_packets; i++) {
+            const int actual = in_xfer->isoc_packet_desc[i].actual_num_bytes;
+            const int requested = in_xfer->isoc_packet_desc[i].num_bytes;
+            if (actual && _ring_buffer_push(iface->ringbuf, in_xfer->data_buffer + i * requested, actual, 0) != ESP_OK) {
+                uac_host_user_interface_callback(iface, UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR);
+                return;
+            }
+        }
+        if (usb_host_transfer_submit(in_xfer) != ESP_OK) {
+            uac_host_user_interface_callback(iface, UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR);
+            return;
+        }
 
         // if ringbuffer is reach the threshold, notify user to read out
         data_len = _ring_buffer_get_len(iface->ringbuf);
@@ -2376,6 +2382,8 @@ esp_err_t uac_host_device_start(uac_host_device_handle_t uac_dev_handle, const u
     iface->cur_alt = UINT8_MAX;
     for (int i = 0; i < iface->dev_info.iface_alt_num; i++) {
         if (iface->iface_alt[i].dev_alt_param.channels == stream_config->channels &&
+                iface->iface_alt[i].dev_alt_param.bit_resolution ==
+                    iface->iface_alt[i].dev_alt_param.subframe_size * 8 &&
                 iface->iface_alt[i].dev_alt_param.bit_resolution == stream_config->bit_resolution) {
             // check if the sample frequency is in the list or in the range
             if (iface->iface_alt[i].dev_alt_param.sample_freq_type > 0) {

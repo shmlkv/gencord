@@ -1,0 +1,36 @@
+# Example only: not installed or started by this change.
+[Unit]
+Description=Private Cardputer stereo intake and two-channel WAV publisher
+After=network.target
+
+[Service]
+Type=simple
+User=gencord-receiver
+Group=gencord-receiver
+EnvironmentFile=/etc/gencord-receiver.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/gencord-receiver/gencord_receiver.py --bind 192.168.1.102 --port 8795 --origin http://192.168.1.102:8795 --state /var/lib/gencord-receiver --recordings-root /opt/ncdata/data/ncp/files/recordings
+StateDirectory=gencord-receiver
+StateDirectoryMode=0700
+UMask=0027
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/gencord-receiver /opt/ncdata/data/ncp/files/recordings/cardputer
+NoNewPrivileges=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=128M
+TasksMax=8
+LimitNOFILE=64
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

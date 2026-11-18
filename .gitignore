@@ -4,3 +4,6 @@ src/config.h
 *.bin
 pipeline/.env
 __pycache__/
+.build-tools/
+logs/
+artifacts/
